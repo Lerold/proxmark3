@@ -5582,3 +5582,282 @@ void SimulateIso14443aTagAID(uint8_t tagType, uint16_t flags, uint8_t *uid,
 
     reply_ng(CMD_HF_MIFARE_SIMULATE, retval, NULL, 0);
 }
+
+// Tag-side S(WTX) request: ask the reader for more time while the relayed
+// round-trip to the real card completes. EmSendCmd adds parity only, so the
+// CRC is appended here. Power level 0, WTXM in 1..59.
+static void EmSend14aWtxReq(bool has_cid, uint8_t cid, uint8_t wtxm) {
+    uint8_t f[5];
+    uint8_t n = 0;
+    f[n++] = has_cid ? 0xFA : 0xF2;     // S(WTX) PCB, 0x08 = CID present
+    if (has_cid) {
+        f[n++] = cid;
+    }
+    f[n++] = (uint8_t)(wtxm & 0x3F);    // power level 0 + WTXM
+    AddCrc14A(f, n);
+    n += 2;
+    EmSendCmd(f, n);
+}
+
+// ISO14443-A type-4 relay: emulate a card, but instead of answering APDUs
+// locally, forward each reader I-block up to the host (reply_ng), hold the
+// reader with S(WTX) until the host relays the real card's response back
+// (receive_ng CMD_HF_ISO14443A_RELAY_RESP), then send that response to the
+// reader. Activation (anticollision/SELECT/RATS/PPS) mirrors
+// SimulateIso14443aTagAID; only the post-activation APDU phase differs.
+// NB: response chaining is not implemented - a relayed answer must fit one
+// frame (true for UID and DESFire-auth exchanges). WTX multiplier/cadence are
+// reader-paced here and may need bench calibration against a strict reader.
+void SimulateIso14443aTagRelay(uint8_t tagType, uint16_t flags, uint8_t *uid,
+                               uint8_t *ats, size_t ats_len, uint8_t wtxm) {
+
+    tag_response_info_t *responses;
+    uint32_t cuid = 0;
+    uint8_t pages = 0;
+
+    uint8_t receivedCmd[MAX_FRAME_SIZE] = { 0x00 };
+    uint8_t receivedCmdPar[MAX_PARITY_SIZE] = { 0x00 };
+
+    // Keep the host-command frame off the stack (this handler is already deep).
+    static PacketCommandNG rx;
+
+    FpgaDownloadAndGo_keep_EM(FPGA_BITSTREAM_HF);
+    BigBuf_free_keep_EM();
+    clear_trace();
+
+    uint8_t *dynamic_response_buffer2 = BigBuf_calloc(DYNAMIC_RESPONSE_BUFFER2_SIZE);
+    if (dynamic_response_buffer2 == NULL) {
+        BigBuf_free_keep_EM();
+        reply_ng(CMD_HF_ISO14443A_RELAY_SIM, PM3_EMALLOC, NULL, 0);
+        return;
+    }
+    uint8_t *dynamic_modulation_buffer2 = BigBuf_calloc(DYNAMIC_MODULATION_BUFFER2_SIZE);
+    if (dynamic_modulation_buffer2 == NULL) {
+        BigBuf_free_keep_EM();
+        reply_ng(CMD_HF_ISO14443A_RELAY_SIM, PM3_EMALLOC, NULL, 0);
+        return;
+    }
+
+    tag_response_info_t dynamic_response_info = {
+        .response = dynamic_response_buffer2,
+        .response_n = 0,
+        .modulation = dynamic_modulation_buffer2,
+        .modulation_n = 0
+    };
+
+    if (SimulateIso14443aInit(tagType, flags, uid, ats, ats_len, &responses, &cuid, &pages, NULL) == false) {
+        BigBuf_free_keep_EM();
+        reply_ng(CMD_HF_ISO14443A_RELAY_SIM, PM3_EINIT, NULL, 0);
+        return;
+    }
+
+    iso14443a_setup(FPGA_HF_ISO14443A_TAGSIM_LISTEN);
+    iso14a_set_timeout(201400);
+
+    uint8_t eff_wtxm = (wtxm == 0 || wtxm > 0x3B) ? 0x3B : wtxm;  // default ~max
+
+    int len = 0;
+    int retval = PM3_SUCCESS;
+    bool odd_reply = true;
+
+    set_tracing(true);
+    LED_A_ON();
+
+    bool finished = false;
+    bool got_rats = false;
+    bool have_last_answer = false;  // dynamic_response_info holds a resend-able I-block
+    while (finished == false) {
+        WDT_HIT();
+
+        tag_response_info_t *p_response = NULL;
+
+        if (GetIso14443aCommandFromReader(receivedCmd, sizeof(receivedCmd), receivedCmdPar, &len) == false) {
+            retval = PM3_EOPABORTED;
+            break;
+        }
+
+        if (receivedCmd[0] == ISO14443A_CMD_REQA && len == 1) {
+            odd_reply = !odd_reply;
+            if (odd_reply) {
+                p_response = &responses[RESP_INDEX_ATQA];
+            }
+        } else if (receivedCmd[0] == ISO14443A_CMD_WUPA && len == 1) {
+            p_response = &responses[RESP_INDEX_ATQA];
+        } else if (receivedCmd[1] == 0x20 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT && len == 2) {
+            p_response = &responses[RESP_INDEX_UIDC1];
+        } else if (receivedCmd[1] == 0x20 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT_2 && len == 2) {
+            p_response = &responses[RESP_INDEX_UIDC2];
+        } else if (receivedCmd[1] == 0x20 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT_3 && len == 2) {
+            p_response = &responses[RESP_INDEX_UIDC3];
+        } else if (receivedCmd[1] == 0x70 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT && len == 9) {
+            p_response = &responses[RESP_INDEX_SAKC1];
+        } else if (receivedCmd[1] == 0x70 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT_2 && len == 9) {
+            p_response = &responses[RESP_INDEX_SAKC2];
+        } else if (receivedCmd[1] == 0x70 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT_3 && len == 9) {
+            p_response = &responses[RESP_INDEX_SAKC3];
+        } else if (receivedCmd[0] == ISO14443A_CMD_PPS) {
+            p_response = &responses[RESP_INDEX_PPS];
+        } else if (receivedCmd[0] == ISO14443A_CMD_HALT && len == 4) {
+            LogTrace(receivedCmd, Uart.len, Uart.startTime * 16 - DELAY_AIR2ARM_AS_TAG, Uart.endTime * 16 - DELAY_AIR2ARM_AS_TAG, Uart.parity, true);
+            p_response = NULL;
+            if (got_rats) {
+                finished = true;
+            }
+        } else if (receivedCmd[0] == ISO14443A_CMD_RATS && len == 4) {
+            p_response = &responses[RESP_INDEX_ATS];
+            got_rats = true;
+        } else {
+            // ISO14443-4 layer.
+            uint8_t pcb = receivedCmd[0];
+
+            if (pcb == 0xC2 || pcb == 0xCA) {
+                // S(DESELECT): echo and end the session.
+                uint8_t dn = 0;
+                dynamic_response_info.response[dn++] = pcb;
+                if (pcb & 0x08) {
+                    dynamic_response_info.response[dn++] = receivedCmd[1];
+                }
+                dynamic_response_info.response_n = dn;
+                AddCrc14A(dynamic_response_info.response, dynamic_response_info.response_n);
+                dynamic_response_info.response_n += 2;
+                if (prepare_tag_modulation(&dynamic_response_info, DYNAMIC_MODULATION_BUFFER2_SIZE)) {
+                    p_response = &dynamic_response_info;
+                }
+                have_last_answer = false;
+                finished = true;
+
+            } else if ((pcb & 0xE6) == 0xA2) {
+                // R-block. On R(NAK) retransmit our last I-block answer so the
+                // reader's ISO14443-4 error recovery resyncs; R(ACK) gets no
+                // reply (we do not chain responses).
+                if ((pcb & 0x10) && have_last_answer) { // R(NAK)
+                    p_response = &dynamic_response_info; // still holds last answer
+                }
+
+            } else if ((pcb & 0xE2) == 0x02) {
+                // I-block carrying an APDU to relay. NAD (0x04) and reader->card
+                // chaining (0x10) are not supported - leave such frames
+                // unanswered rather than relay a fragment.
+                if (pcb & 0x14) {
+                    p_response = NULL;
+                } else {
+                    bool has_cid = (pcb & 0x08);
+                    uint8_t hdr = 1 + (has_cid ? 1 : 0);
+                    uint8_t cid = has_cid ? receivedCmd[1] : 0;
+
+                    if (len < hdr + 2) {
+                        continue;  // malformed; no response
+                    }
+                    uint16_t apdu_len = len - hdr - 2;  // strip PCB[/CID] and CRC
+
+                    // forward the reader's APDU up to the host
+                    reply_ng(CMD_HF_ISO14443A_RELAY_APDU, PM3_SUCCESS, receivedCmd + hdr, apdu_len);
+
+                    // Hold the reader with S(WTX) until the host relays the real
+                    // card's response. Strict lockstep: every tag frame we emit
+                    // (a WTX or the final answer) is sent immediately after
+                    // receiving a reader frame, so the answer pairs with a fresh
+                    // frame and the ISO14443-4 FDT holds. This first WTX pairs
+                    // with the I-block received above.
+                    EmSend14aWtxReq(has_cid, cid, eff_wtxm);
+
+                    bool answered = false;
+                    bool aborted = false;
+                    bool have_host = false;
+
+                    while (answered == false && aborted == false) {
+                        WDT_HIT();
+                        if (BUTTON_PRESS()) {
+                            aborted = true;
+                            break;
+                        }
+
+                        if (GetIso14443aCommandFromReader(receivedCmd, sizeof(receivedCmd), receivedCmdPar, &len)) {
+                            uint8_t rpcb = receivedCmd[0];
+                            if (rpcb == 0xC2 || rpcb == 0xCA) {
+                                // reader deselected mid-wait: ack it, then stop.
+                                uint8_t dn = 0;
+                                dynamic_response_info.response[dn++] = rpcb;
+                                if (rpcb & 0x08) {
+                                    dynamic_response_info.response[dn++] = receivedCmd[1];
+                                }
+                                dynamic_response_info.response_n = dn;
+                                AddCrc14A(dynamic_response_info.response, dynamic_response_info.response_n);
+                                dynamic_response_info.response_n += 2;
+                                if (prepare_tag_modulation(&dynamic_response_info, DYNAMIC_MODULATION_BUFFER2_SIZE)) {
+                                    EmSendPrecompiledCmd(&dynamic_response_info);
+                                }
+                                have_last_answer = false;
+                                aborted = true;
+                                break;
+                            }
+
+                            if (have_host) {
+                                // card's answer in hand and a fresh reader frame
+                                // just received: build and send the I-block now.
+                                uint16_t rlen = rx.length;
+                                uint8_t off = has_cid ? 2 : 1;
+                                if ((uint32_t)off + rlen + 2 > DYNAMIC_RESPONSE_BUFFER2_SIZE) {
+                                    aborted = true;  // too large; chaining unimplemented
+                                    break;
+                                }
+                                dynamic_response_info.response[0] = pcb; // echo: blocknum + CID bit
+                                if (has_cid) {
+                                    dynamic_response_info.response[1] = cid;
+                                }
+                                memcpy(dynamic_response_info.response + off, rx.data.asBytes, rlen);
+                                dynamic_response_info.response_n = off + rlen;
+                                AddCrc14A(dynamic_response_info.response, dynamic_response_info.response_n);
+                                dynamic_response_info.response_n += 2;
+                                if (prepare_tag_modulation(&dynamic_response_info, DYNAMIC_MODULATION_BUFFER2_SIZE) == false) {
+                                    aborted = true;
+                                    break;
+                                }
+                                EmSendPrecompiledCmd(&dynamic_response_info);
+                                have_last_answer = true;
+                                answered = true;
+                            } else {
+                                // still waiting on the host: keep extending.
+                                EmSend14aWtxReq(has_cid, cid, eff_wtxm);
+                            }
+                        } else {
+                            // GetIso false: button press or host data waiting.
+                            if (BUTTON_PRESS()) {
+                                aborted = true;
+                                break;
+                            }
+                            if (data_available()) {
+                                if (receive_ng(&rx) == PM3_SUCCESS) {
+                                    if (rx.cmd == CMD_HF_ISO14443A_RELAY_RESP) {
+                                        have_host = true;
+                                    } else {
+                                        aborted = true;  // e.g. CMD_BREAK_LOOP
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // the answer / deselect ack was emitted inline; nothing for
+                    // the loop tail to send.
+                    p_response = NULL;
+                    if (aborted) {
+                        retval = PM3_EOPABORTED;
+                        finished = true;
+                    }
+                }
+            } else {
+                // Anything else: do not respond.
+                p_response = NULL;
+            }
+        }
+
+        EmSendPrecompiledCmd(p_response);
+    }
+
+    switch_off();
+    set_tracing(false);
+    BigBuf_free_keep_EM();
+
+    reply_ng(CMD_HF_ISO14443A_RELAY_SIM, retval, NULL, 0);
+}

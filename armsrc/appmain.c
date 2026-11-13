@@ -2583,6 +2583,21 @@ static void PacketReceived(PacketCommandNG *packet) {
                                     payload->getdata_response, payload->getdata_response_len);
             break;
         }
+        case CMD_HF_ISO14443A_RELAY_SIM: {
+            struct p {
+                uint8_t tagtype;
+                uint16_t flags;
+                uint8_t uid[10];
+                uint8_t ats[20];
+                uint16_t ats_len;
+                uint8_t wtxm;
+            } PACKED;
+            struct p *payload = (struct p *) packet->data.asBytes;
+            // ## Relay-sim: emulate iso14443a type-4, forward APDUs to the host
+            SimulateIso14443aTagRelay(payload->tagtype, payload->flags, payload->uid,
+                                      payload->ats, payload->ats_len, payload->wtxm);
+            break;
+        }
         case CMD_HF_HIDCONFIG_SIM: {
             SimulateHIDConfigCard((const hid_sim_payload_t *) packet->data.asBytes);
             break;

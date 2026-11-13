@@ -165,6 +165,9 @@ void SimulateIso14443aTagAID(uint8_t tagType, uint16_t flags, uint8_t *uid,
                              uint8_t *selectaid_response, size_t selectaid_response_len,
                              uint8_t *getdata_response, size_t getdata_response_len);
 
+void SimulateIso14443aTagRelay(uint8_t tagType, uint16_t flags, uint8_t *uid,
+                               uint8_t *ats, size_t ats_len, uint8_t wtxm);
+
 void iso14a_set_atqa_sak_override(uint16_t atqa, uint8_t sak);
 uint8_t iso14a_get_pcb_blocknum(void);
 void iso14a_toggle_pcb_blocknum(void);

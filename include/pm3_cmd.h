@@ -1253,6 +1253,12 @@ typedef struct {
 
 #define CMD_HF_ISO14443A_SET_THRESHOLDS 0x03B8
 
+// ISO14443-A type-4 relay-sim: emulate a card while forwarding each reader
+// APDU to the host and injecting the real card's relayed response.
+#define CMD_HF_ISO14443A_RELAY_SIM 0x03C0  // host -> ARM: start relay-sim; final status reply
+#define CMD_HF_ISO14443A_RELAY_APDU 0x03C1 // ARM -> host: reader APDU (I-block payload)
+#define CMD_HF_ISO14443A_RELAY_RESP 0x03C2 // host -> ARM: real card's response APDU (no CRC)
+
 // For 14b config
 #define CMD_HF_ISO14443B_PRINT_CONFIG 0x03D0
 #define CMD_HF_ISO14443B_GET_CONFIG 0x03D1
